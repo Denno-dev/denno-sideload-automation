@@ -1,0 +1,7 @@
+{
+  "name": "denno-sideload-automation",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Merge AltStore/SideStore source JSONs and publish to a GitHub Gist"
+}
