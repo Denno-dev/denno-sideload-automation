@@ -1,0 +1,38 @@
+name: Merge Sources
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * *"   # daily ~06:00 UTC
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          elif [ -f package.json ]; then
+            npm install --package-lock=false
+          else
+            echo "No package.json — skipping npm install"
+          fi
+
+      - name: Run merge script
+        env:
+          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          GIST_FILENAME: ${{ vars.GIST_FILENAME || 'source.json' }}
+          SOURCE_NAME: ${{ vars.SOURCE_NAME || 'My SideStore Source' }}
+          SOURCE_IDENTIFIER: ${{ vars.SOURCE_IDENTIFIER || 'com.example.sidestore' }}
+        run: node scripts/merge-sources.mjs
