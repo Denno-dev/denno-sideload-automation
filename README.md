@@ -83,7 +83,7 @@ Commit and push to `main`.
 
 ### 6. Run the workflow
 
-**Actions** → **Merge sources** (or whatever the workflow is named) → **Run workflow**.
+**Actions** → **Merge Sources** → **Run workflow**.
 
 When it finishes, open:
 
@@ -99,14 +99,16 @@ Add that URL as a source in SideStore / AltStore / KSign.
 
 ```text
 .
-├── sources.json              # Your list of upstream source URLs (required)
-├── sources.example.json      # Sample list (optional reference)
-├── blocked-bundle-ids.json   # Optional: bundle IDs to never publish
+├── sources.json                 # Your list of upstream source URLs (required)
+├── sources.example.json         # Sample list (optional reference)
+├── blocked-bundle-ids.json      # Optional: bundle IDs to never publish
 ├── scripts/
-│   └── merge-sources.mjs     # Merger + sanitizer + Gist publisher
+│   └── merge-sources.mjs        # Merger + sanitizer + Gist publisher
 ├── .github/workflows/
-│   └── merge.yml             # Scheduled + manual workflow
-├── LICENSE                   # MIT
+│   ├── merge.yml                # Scheduled + manual merge / publish
+│   └── security-scan.yml        # Semgrep, gitleaks, npm audit
+├── package.json
+├── LICENSE                      # MIT
 └── README.md
 ```
 
@@ -159,16 +161,28 @@ Hand-added apps that only exist in the Gist (not in any URL in `sources.json`) a
 
 ---
 
-## Workflow
+## Workflows
 
-Typical `merge.yml` behavior:
+### Merge Sources (`merge.yml`)
 
-- **Triggers:** `workflow_dispatch` (manual) and optional `schedule` (e.g. daily)
-- **Runtime:** Node.js
+- **Triggers:** `workflow_dispatch` (manual) and daily schedule (`0 6 * * *` UTC)
+- **Runtime:** Node.js 22
 - **Env:** `GIST_TOKEN`, `GIST_ID`, optional name/identifier/filename variables
 - **On success:** Gist file updated; SideStore clients pick it up on refresh (raw URLs can cache briefly)
 
-Recommended: run manually once after setup, then enable a daily schedule.
+Recommended: run manually once after setup, then leave the daily schedule on.
+
+### Security Scan (`security-scan.yml`)
+
+Runs on push/PR to `main` (and manually):
+
+| Job | What it does |
+|-----|----------------|
+| **Semgrep** | SAST on the JS merge script (no GitHub Advanced Security required) |
+| **gitleaks** | Scans history for accidentally committed secrets |
+| **npm audit** | Dependency audit when `package.json` is present |
+
+These are optional hygiene checks for the template itself. They do not publish your source.
 
 ---
 
@@ -201,6 +215,7 @@ Recommended: run manually once after setup, then enable a daily schedule.
 - Use repository secrets only
 - Prefer a classic PAT limited to the `gist` scope
 - This pipeline only needs to read public source URLs and PATCH your own Gist
+- `security-scan.yml` helps catch accidental secret commits and basic code issues on PRs
 
 ---
 
