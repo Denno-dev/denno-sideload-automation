@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * SideStore / AltStore source merger.
- * Fetches upstream sources, merges by bundleIdentifier, sanitizes dates,
+ * SideStore / AltStore / KSign source merger.
+ * Fetches upstream sources, merges by bundleIdentifier, sanitizes for strict clients,
  * and publishes to a GitHub Gist.
  */
 
@@ -14,8 +14,20 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, "..");
 
 const FALLBACK_DATE = "2024-01-01T00:00:00Z";
+/** KSign rejects missing/empty minOSVersion. */
+const FALLBACK_MIN_OS = "12.0";
 
-/* ---------- CONFIG ---------- */
+const ALLOWED_APP_FIELDS = new Set([
+  "name", "bundleIdentifier", "developerName", "subtitle", "localizedDescription",
+  "iconURL", "tintColor", "screenshots", "versions",
+  "version", "date", "downloadURL", "size", "minOSVersion",
+  "beta", "category", "website",
+]);
+const ALLOWED_VERSION_FIELDS = new Set([
+  "version", "buildVersion", "date", "downloadURL", "size", "minOSVersion",
+  "maxOSVersion", "localizedDescription",
+]);
+
 async function fileExists(p) {
   try {
     await access(p, fsConstants.R_OK);
@@ -38,7 +50,6 @@ async function loadBlockedBundleIds() {
   }
 }
 
-/* ---------- BASIC HELPERS ---------- */
 function safeText(v) {
   if (v === null || v === undefined) return "";
   if (typeof v === "object") return "";
@@ -49,9 +60,7 @@ function normalizeDate(value) {
   if (value === null || value === undefined) return FALLBACK_DATE;
   let d = String(value).trim();
   if (!d) return FALLBACK_DATE;
-
   d = d.replace("+00:00", "Z").replace(/\+0000$/, "Z");
-
   try {
     const probe = d.endsWith("Z") ? d.slice(0, -1) + "+00:00" : d;
     const dt = new Date(probe);
@@ -59,22 +68,30 @@ function normalizeDate(value) {
       if (d.includes("T") && (d.endsWith("Z") || /[+\-]\d{2}:?\d{2}$/.test(d))) {
         return dt.toISOString().replace(/\.\d{3}Z$/, "Z");
       }
-      if (/^\d{4}-\d{2}-\d{2}$/.test(d)) {
-        return d + "T00:00:00Z";
-      }
+      if (/^\d{4}-\d{2}-\d{2}$/.test(d)) return d + "T00:00:00Z";
       return dt.toISOString().replace(/\.\d{3}Z$/, "Z");
     }
-  } catch {
-    /* fall through */
-  }
-
+  } catch {}
   for (const fmt of [d.slice(0, 19), d.slice(0, 10)]) {
     const dt = new Date(fmt);
-    if (!isNaN(dt.getTime())) {
-      return dt.toISOString().replace(/\.\d{3}Z$/, "Z");
-    }
+    if (!isNaN(dt.getTime())) return dt.toISOString().replace(/\.\d{3}Z$/, "Z");
   }
   return FALLBACK_DATE;
+}
+
+function normalizeMinOS(value) {
+  if (value === null || value === undefined) return FALLBACK_MIN_OS;
+  const s = String(value).trim();
+  return s || FALLBACK_MIN_OS;
+}
+
+function normalizeSize(value) {
+  if (typeof value === "number" && !isNaN(value)) return Math.max(0, Math.round(value));
+  if (typeof value === "string") {
+    const n = parseInt(value.replace(/[^\d]/g, ""), 10);
+    if (!isNaN(n)) return n;
+  }
+  return 0;
 }
 
 function versionSortKey(v) {
@@ -87,8 +104,7 @@ function compareVersionStrings(a, b) {
   const pb = String(b || "0").split(/[.\-]/).map((n) => parseInt(n, 10) || 0);
   const len = Math.max(pa.length, pb.length);
   for (let i = 0; i < len; i++) {
-    const x = pa[i] || 0,
-      y = pb[i] || 0;
+    const x = pa[i] || 0, y = pb[i] || 0;
     if (x !== y) return x - y;
   }
   return 0;
@@ -97,8 +113,7 @@ function compareVersionStrings(a, b) {
 function isNewer(a, b) {
   if (!b) return true;
   if (!a) return false;
-  const da = versionSortKey(a),
-    db = versionSortKey(b);
+  const da = versionSortKey(a), db = versionSortKey(b);
   if (da !== null && db !== null) return da > db;
   return compareVersionStrings(a.version, b.version) > 0;
 }
@@ -108,134 +123,110 @@ function pickLatestVersion(versions) {
   return versions.reduce((best, cur) => (isNewer(cur, best) ? cur : best), null);
 }
 
-function permissionLabel(p) {
-  if (p === null || p === undefined) return "";
-  if (typeof p === "string") return p;
-  if (typeof p === "object") {
-    const label = p.type || p.name || p.identifier || p.key || p.permission;
-    return label ? safeText(label) : "";
-  }
-  return safeText(p);
-}
-
 function toScreenshotList(val) {
   if (!val) return [];
   const urls = [];
-
   const pushItem = (item) => {
     if (!item) return;
-    if (typeof item === "string") {
-      urls.push(item);
-    } else if (typeof item === "object" && item.imageURL) {
-      urls.push(String(item.imageURL));
-    }
+    if (typeof item === "string") urls.push(item);
+    else if (typeof item === "object" && item.imageURL) urls.push(String(item.imageURL));
   };
-
   if (Array.isArray(val)) {
     for (const item of val) pushItem(item);
     return [...new Set(urls.filter(Boolean))];
   }
-
   if (typeof val === "object") {
     for (const v of Object.values(val)) {
-      if (Array.isArray(v)) {
-        for (const item of v) pushItem(item);
-      } else {
-        pushItem(v);
-      }
+      if (Array.isArray(v)) for (const item of v) pushItem(item);
+      else pushItem(v);
     }
     return [...new Set(urls.filter(Boolean))];
   }
-
   return [];
 }
 
 function ensureVersions(app) {
   let versions = Array.isArray(app.versions) ? app.versions.slice() : [];
-
   versions = versions.filter((v) => v && (v.downloadURL || v.url));
-
   versions = versions.map((v) => ({
-    ...v,
+    version: v.version != null ? String(v.version) : "",
     date: normalizeDate(v.date),
     downloadURL: v.downloadURL || v.url || "",
-    version: v.version != null ? String(v.version) : "",
+    size: normalizeSize(v.size ?? app.size),
+    minOSVersion: normalizeMinOS(v.minOSVersion || app.minOSVersion),
+    ...(v.buildVersion != null ? { buildVersion: String(v.buildVersion) } : {}),
+    ...(v.localizedDescription
+      ? { localizedDescription: String(v.localizedDescription) }
+      : {}),
+    ...(v.maxOSVersion ? { maxOSVersion: String(v.maxOSVersion) } : {}),
   }));
-
   if (!versions.length && app.downloadURL) {
-    versions = [
-      {
-        version: app.version != null ? String(app.version) : "1.0",
-        date: normalizeDate(app.date || app.versionDate),
-        downloadURL: app.downloadURL,
-        size: app.size || 0,
-        ...(app.minOSVersion ? { minOSVersion: app.minOSVersion } : {}),
-        ...(app.localizedDescription || app.versionDescription
-          ? {
-              localizedDescription:
-                app.localizedDescription || app.versionDescription,
-            }
-          : {}),
-      },
-    ];
+    versions = [{
+      version: app.version != null ? String(app.version) : "1.0",
+      date: normalizeDate(app.date || app.versionDate),
+      downloadURL: app.downloadURL,
+      size: normalizeSize(app.size),
+      minOSVersion: normalizeMinOS(app.minOSVersion),
+    }];
   }
-
-  versions = versions.map((v) => ({
-    ...v,
-    date: normalizeDate(v.date),
-  }));
-
   return versions;
+}
+
+function stripVersion(v) {
+  const out = {};
+  for (const k of ALLOWED_VERSION_FIELDS) {
+    if (v[k] !== undefined && v[k] !== null) out[k] = v[k];
+  }
+  return out;
+}
+
+function stripApp(app) {
+  const out = {};
+  for (const k of ALLOWED_APP_FIELDS) {
+    if (app[k] !== undefined && app[k] !== null) out[k] = app[k];
+  }
+  if (out.screenshots && !Array.isArray(out.screenshots)) {
+    out.screenshots = toScreenshotList(out.screenshots);
+  }
+  return out;
 }
 
 function normalizeApp(app) {
   const versions = ensureVersions(app);
   const latest = pickLatestVersion(versions);
   const versionInfo = latest || {};
-
-  let screenshots;
-  if (
-    app.screenshots &&
-    typeof app.screenshots === "object" &&
-    !Array.isArray(app.screenshots)
-  ) {
-    screenshots = app.screenshots;
-  } else {
-    screenshots = toScreenshotList(app.screenshotURLs || app.screenshots);
-  }
-
-  const permissions = (() => {
-    let perms = [];
-    if (app.appPermissions) {
-      if (Array.isArray(app.appPermissions.entitlements)) {
-        perms.push(...app.appPermissions.entitlements.map(permissionLabel));
-      }
-      if (
-        app.appPermissions.privacy &&
-        typeof app.appPermissions.privacy === "object"
-      ) {
-        perms.push(...Object.keys(app.appPermissions.privacy));
-      }
-    }
-    if (Array.isArray(app.permissions)) {
-      perms.push(...app.permissions.map(permissionLabel));
-    }
-    return [...new Set(perms.filter(Boolean))];
-  })();
-
+  const screenshots = toScreenshotList(app.screenshotURLs || app.screenshots);
   const date = normalizeDate(versionInfo.date || app.date || app.versionDate);
+  const minOSVersion = normalizeMinOS(versionInfo.minOSVersion || app.minOSVersion);
 
-  return {
-    ...app,
+  const versionsOut = (latest ? [latest] : versions.slice(0, 1)).map((v) =>
+    stripVersion({
+      ...v,
+      date: normalizeDate(v.date),
+      size: normalizeSize(v.size),
+      minOSVersion: normalizeMinOS(v.minOSVersion || minOSVersion),
+    })
+  );
+
+  return stripApp({
+    name: app.name,
+    bundleIdentifier: app.bundleIdentifier,
+    developerName: app.developerName || "",
+    subtitle: app.subtitle || "",
+    localizedDescription: app.localizedDescription || "",
+    iconURL: app.iconURL || "",
+    tintColor: app.tintColor,
+    website: app.website,
+    beta: app.beta,
+    category: app.category,
     downloadURL: versionInfo.downloadURL || app.downloadURL || "",
     version: versionInfo.version || app.version || "",
-    size: versionInfo.size || app.size || 0,
+    size: normalizeSize(versionInfo.size || app.size),
     date,
-    minOSVersion: versionInfo.minOSVersion || app.minOSVersion || "",
+    minOSVersion,
     screenshots,
-    permissions,
-    versions: latest ? [latest] : versions.slice(0, 1),
-  };
+    versions: versionsOut,
+  });
 }
 
 function sanitizeExistingApps(apps, blocked) {
@@ -252,89 +243,70 @@ function sanitizeExistingApps(apps, blocked) {
       try {
         return normalizeApp(app);
       } catch (e) {
-        console.warn(
-          `⚠️ Failed to sanitize existing app ${app?.bundleIdentifier || "?"}: ${e.message}`
-        );
-        return app;
+        console.warn(`⚠️ Failed to sanitize ${app?.bundleIdentifier || "?"}: ${e.message}`);
+        return null;
       }
-    });
+    })
+    .filter(Boolean);
 }
 
-function mergeAppInto(mergedApps, app, sourceName, blocked) {
+function mergeAppInto(mergedApps, app, blocked) {
   const normalized = normalizeApp(app);
   const bundleId = safeText(normalized.bundleIdentifier);
-  if (!bundleId) return;
-  if (blocked.has(bundleId)) return;
+  if (!bundleId || blocked.has(bundleId)) return;
 
   const existing = mergedApps.find((a) => a.bundleIdentifier === bundleId);
-
   if (!existing) {
-    normalized._sources = [sourceName];
     mergedApps.push(normalized);
     return;
   }
 
-  existing._sources = Array.isArray(existing._sources) ? existing._sources : [];
-  if (!existing._sources.includes(sourceName)) existing._sources.push(sourceName);
-
   existing.iconURL = existing.iconURL || normalized.iconURL;
   existing.developerName = existing.developerName || normalized.developerName;
   existing.subtitle = existing.subtitle || normalized.subtitle;
-
-  const existingIsObject =
-    existing.screenshots &&
-    typeof existing.screenshots === "object" &&
-    !Array.isArray(existing.screenshots);
-  const incomingIsObject =
-    normalized.screenshots &&
-    typeof normalized.screenshots === "object" &&
-    !Array.isArray(normalized.screenshots);
-
-  if (existingIsObject || incomingIsObject) {
-    if (!existingIsObject && incomingIsObject) {
-      existing.screenshots = normalized.screenshots;
-    }
-  } else {
-    const combined = [
+  existing.screenshots = [
+    ...new Set([
       ...toScreenshotList(existing.screenshots),
       ...toScreenshotList(normalized.screenshots),
-    ];
-    existing.screenshots = [...new Set(combined)];
-  }
-
-  const existingPerms = Array.isArray(existing.permissions)
-    ? existing.permissions
-    : [];
-  const incomingPerms = Array.isArray(normalized.permissions)
-    ? normalized.permissions
-    : [];
-  existing.permissions = [
-    ...new Set([...existingPerms, ...incomingPerms].filter(Boolean)),
+    ]),
   ];
 
   const candidate = pickLatestVersion(normalized.versions);
   const current = pickLatestVersion(existing.versions);
   if (candidate && isNewer(candidate, current)) {
-    existing.versions = [{ ...candidate, date: normalizeDate(candidate.date) }];
+    const minOS = normalizeMinOS(candidate.minOSVersion || existing.minOSVersion);
+    existing.versions = [
+      stripVersion({
+        ...candidate,
+        date: normalizeDate(candidate.date),
+        minOSVersion: minOS,
+        size: normalizeSize(candidate.size),
+      }),
+    ];
     existing.downloadURL = candidate.downloadURL || existing.downloadURL;
     existing.version = candidate.version || existing.version;
-    existing.size = candidate.size || existing.size;
+    existing.size = normalizeSize(candidate.size || existing.size);
     existing.date = normalizeDate(candidate.date || existing.date);
-    existing.minOSVersion = candidate.minOSVersion || existing.minOSVersion;
+    existing.minOSVersion = minOS;
   } else if (!current && candidate) {
-    existing.versions = [{ ...candidate, date: normalizeDate(candidate.date) }];
+    const minOS = normalizeMinOS(candidate.minOSVersion || existing.minOSVersion);
+    existing.versions = [
+      stripVersion({
+        ...candidate,
+        date: normalizeDate(candidate.date),
+        minOSVersion: minOS,
+        size: normalizeSize(candidate.size),
+      }),
+    ];
     existing.downloadURL = candidate.downloadURL || existing.downloadURL;
     existing.version = candidate.version || existing.version;
-    existing.size = candidate.size || existing.size;
+    existing.size = normalizeSize(candidate.size || existing.size);
     existing.date = normalizeDate(candidate.date || existing.date);
+    existing.minOSVersion = minOS;
   } else {
     existing.date = normalizeDate(existing.date);
-    if (Array.isArray(existing.versions)) {
-      existing.versions = existing.versions.map((v) => ({
-        ...v,
-        date: normalizeDate(v.date),
-      }));
-    }
+    existing.minOSVersion = normalizeMinOS(existing.minOSVersion);
+    existing.size = normalizeSize(existing.size);
   }
 }
 
@@ -372,16 +344,17 @@ async function main() {
   }
 
   const blocked = await loadBlockedBundleIds();
-  if (blocked.size) {
-    console.log(`🚫 Loaded ${blocked.size} blocked bundle ID(s).`);
-  }
+  if (blocked.size) console.log(`🚫 Loaded ${blocked.size} blocked bundle ID(s).`);
 
   const ghToken = process.env.GH_TOKEN || process.env.GIST_TOKEN;
   const gistId = process.env.GIST_ID;
   const filename = process.env.GIST_FILENAME || "source.json";
   const sourceName = process.env.SOURCE_NAME || "My SideStore Source";
-  const sourceIdentifier =
-    process.env.SOURCE_IDENTIFIER || "com.example.sidestore";
+  const sourceIdentifier = process.env.SOURCE_IDENTIFIER || "com.example.sidestore";
+  const sourceSubtitle = process.env.SOURCE_SUBTITLE || "Merged AltStore / SideStore sources";
+  const sourceIcon = process.env.SOURCE_ICON_URL || "";
+  const sourceWebsite = process.env.SOURCE_WEBSITE || "";
+  const sourceTint = process.env.SOURCE_TINT || "5B8CFF";
 
   let mergedApps = [];
   const failures = [];
@@ -397,58 +370,34 @@ async function main() {
     if (existingRes.ok) {
       const gistData = await existingRes.json();
       let file = gistData.files[filename];
-
       if (file && file.truncated && file.raw_url) {
-        console.log(
-          `ℹ️ "${filename}" content was truncated by the API — fetching full file from raw_url.`
-        );
         const rawRes = await fetch(file.raw_url);
-        if (rawRes.ok) {
-          file = { ...file, content: await rawRes.text() };
-        } else {
-          console.warn(
-            `⚠️ Could not fetch raw_url for truncated file: HTTP ${rawRes.status}`
-          );
-        }
+        if (rawRes.ok) file = { ...file, content: await rawRes.text() };
       }
-
       if (file && file.content) {
         try {
           const parsed = JSON.parse(file.content);
           if (Array.isArray(parsed.apps)) {
             mergedApps = sanitizeExistingApps(parsed.apps, blocked);
-            console.log(
-              `📥 Loaded ${mergedApps.length} existing apps from Gist (sanitized).`
-            );
+            console.log(`📥 Loaded ${mergedApps.length} existing apps from Gist (sanitized).`);
           }
         } catch {
           throw new Error(
-            `Existing Gist file "${filename}" could not be parsed as JSON. Refusing to continue, ` +
-              `since proceeding would overwrite your existing gist with an incomplete apps list.`
+            `Existing Gist file "${filename}" could not be parsed as JSON. Refusing to continue.`
           );
         }
       }
     } else {
       const body = await existingRes.text();
-      if (existingRes.status === 404) {
-        throw new Error(
-          `GET /gists/${gistId} returned 404. Either GIST_ID is wrong (check for stray ` +
-            `whitespace when pasted) or GH_TOKEN belongs to an account that doesn't own this ` +
-            `gist. Raw response: ${body}`
-        );
-      }
-      throw new Error(
-        `Could not load existing Gist: HTTP ${existingRes.status} — ${body}`
-      );
+      throw new Error(`Could not load existing Gist: HTTP ${existingRes.status} — ${body}`);
     }
   }
 
   for (const url of sources) {
     try {
       const src = await fetchJSON(url);
-      const name = safeText(src.name || url);
       if (Array.isArray(src.apps)) {
-        src.apps.forEach((app) => mergeAppInto(mergedApps, app, name, blocked));
+        src.apps.forEach((app) => mergeAppInto(mergedApps, app, blocked));
         console.log(`✓ ${url} — ${src.apps.length} apps`);
       } else {
         failures.push({ url, reason: "no apps array in response" });
@@ -464,28 +413,30 @@ async function main() {
   for (const app of mergedApps) {
     const clean = normalizeApp(app);
     const bid = safeText(clean.bundleIdentifier);
-    if (blocked.has(bid)) continue;
-    if (!dedupedApps.find((a) => a.bundleIdentifier === bid)) {
-      dedupedApps.push(clean);
-    }
+    if (!bid || blocked.has(bid)) continue;
+    if (!dedupedApps.find((a) => a.bundleIdentifier === bid)) dedupedApps.push(clean);
   }
+
+  const iconURL =
+    sourceIcon ||
+    dedupedApps.find((a) => a.iconURL)?.iconURL ||
+    undefined;
 
   const output = {
     name: sourceName,
     identifier: sourceIdentifier,
+    subtitle: sourceSubtitle,
+    tintColor: sourceTint,
+    ...(iconURL ? { iconURL } : {}),
+    ...(sourceWebsite ? { website: sourceWebsite } : {}),
     apps: dedupedApps,
   };
 
-  console.log(
-    `\nMerged ${dedupedApps.length} total apps (${failures.length} failed).`
-  );
+  console.log(`\nMerged ${dedupedApps.length} total apps (${failures.length} failed).`);
 
   if (!ghToken || !gistId) {
     console.log("\nGH_TOKEN / GIST_ID not set — writing merged output locally.");
-    await writeFile(
-      path.join(ROOT, "merged-source.json"),
-      JSON.stringify(output, null, 2)
-    );
+    await writeFile(path.join(ROOT, "merged-source.json"), JSON.stringify(output, null, 2));
     console.log("Wrote merged-source.json");
     return;
   }
@@ -498,22 +449,16 @@ async function main() {
       Accept: "application/vnd.github+json",
     },
     body: JSON.stringify({
-      files: {
-        [filename]: { content: JSON.stringify(output, null, 2) },
-      },
+      files: { [filename]: { content: JSON.stringify(output, null, 2) } },
     }),
   });
 
   if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Gist update failed: HTTP ${res.status} — ${body}`);
+    throw new Error(`Gist update failed: HTTP ${res.status} — ${await res.text()}`);
   }
 
   console.log(`\n✅ Updated gist ${gistId} (${filename}).`);
-
-  if (failures.length) {
-    process.exitCode = 1;
-  }
+  if (failures.length) process.exitCode = 1;
 }
 
 main().catch((e) => {
